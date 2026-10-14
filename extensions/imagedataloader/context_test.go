@@ -38,14 +38,30 @@ func TestImageContextGetCacheHitReleasesReadLock(t *testing.T) {
 }
 
 type fakeFetcher struct {
-	mu    sync.Mutex
-	calls map[string]int
+	mu       sync.Mutex
+	calls    map[string]int
+	inflight int
+	// when release is set, every fetch blocks until overlap fetches are in flight
+	overlap int
+	release chan struct{}
 }
 
 func (f *fakeFetcher) FetchImageData(_ context.Context, image string, _ []remote.Option, _ []name.Option) (*ImageData, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls[image]++
+	f.inflight++
+	if f.release != nil && f.inflight == f.overlap {
+		close(f.release)
+	}
+	f.mu.Unlock()
+
+	if f.release != nil {
+		select {
+		case <-f.release:
+		case <-time.After(5 * time.Second):
+			return nil, errors.New("fetches did not overlap")
+		}
+	}
 	if image == "example.com/broken:latest" {
 		return nil, errors.New("fetch failed")
 	}
@@ -58,7 +74,11 @@ func TestImageContextAddImagesConcurrentWorkers(t *testing.T) {
 		img := fmt.Sprintf("example.com/image-%d:latest", i)
 		images = append(images, img, img)
 	}
-	fetcher := &fakeFetcher{calls: map[string]int{}}
+	fetcher := &fakeFetcher{
+		calls:   map[string]int{},
+		overlap: workers,
+		release: make(chan struct{}),
+	}
 	ctx := &imageContext{
 		f:    fetcher,
 		list: map[string]*ImageData{},
